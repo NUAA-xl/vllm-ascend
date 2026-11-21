@@ -560,6 +560,15 @@ void npu_fused_scatter_copy_sparse_flash_attention_meta(
 {
 }
 
+void npu_fused_quant_scatter_copy_sparse_flash_attention_meta(
+    const at::Tensor&, at::Tensor, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, double, at::Tensor)
+{
+}
+
 std::tuple<at::Tensor,at::Tensor, at::Tensor> npu_add_rms_norm_bias_meta(
     const at::Tensor& x1,
     const at::Tensor& x2,
@@ -1883,6 +1892,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     // Fused copy and sparse flash attention for MTP
     ops.impl("npu_fused_scatter_copy_sparse_flash_attention",
              &vllm_ascend::meta::npu_fused_scatter_copy_sparse_flash_attention_meta);
+    ops.impl("npu_fused_quant_scatter_copy_sparse_flash_attention",
+             &vllm_ascend::meta::npu_fused_quant_scatter_copy_sparse_flash_attention_meta);
     // MoE dispatch-ffn-combine
     ops.impl("dispatch_ffn_combine", &vllm_ascend::meta::dispatch_ffn_combine_meta);
     // Add_Rms_Norm_Bias
