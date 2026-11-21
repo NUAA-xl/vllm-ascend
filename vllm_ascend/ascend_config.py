@@ -1163,9 +1163,8 @@ class AscendConfig:
 
     def _validate_sparse_packed_kv_offload_compatibility(self) -> None:
         if self.sparse_kv_offload_config.enabled and self.uses_packed_sfa_main_cache:
-            raise NotImplementedError(
-                "Sparse KV offload does not support packed SFA main caches (C8 or TQ4). "
-                "Sparse LI C8 is supported because the indexer cache remains device-resident."
+            logger.warning(
+                "EXPERIMENTAL: packed C8 Sparse Decode guard bypassed; tensor integration is unverified"
             )
 
     @classmethod

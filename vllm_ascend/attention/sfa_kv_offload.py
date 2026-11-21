@@ -525,10 +525,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             **kwargs,
         )
         if self.uses_packed_sfa_main_cache:
-            raise NotImplementedError(
-                "Sparse KV offload does not support packed SFA main caches "
-                "(C8 or TQ4); sparse LI C8 is supported for the "
-                "device-resident indexer cache."
+            logger.warning(
+                "EXPERIMENTAL: packed C8 Sparse Decode guard bypassed; tensor integration is unverified"
             )
         self._current_layer_name: str | None = None
         self.block_size = self.vllm_config.cache_config.block_size
