@@ -1162,10 +1162,10 @@ class AscendConfig:
             )
 
     def _validate_sparse_packed_kv_offload_compatibility(self) -> None:
+        if self.sparse_kv_offload_config.enabled and self.enable_sparse_sfa_turboquant:
+            raise NotImplementedError("Sparse KV offload does not support TQ4 main caches")
         if self.sparse_kv_offload_config.enabled and self.uses_packed_sfa_main_cache:
-            logger.warning(
-                "EXPERIMENTAL: packed C8 Sparse Decode guard bypassed; tensor integration is unverified"
-            )
+            logger.warning("EXPERIMENTAL: packed C8 Sparse Decode guard bypassed; tensor integration is unverified")
 
     @classmethod
     def _check_mooncake_c8_kv_cache_quant(cls, vllm_config: VllmConfig) -> None:
@@ -1856,7 +1856,7 @@ class SparseKVOffloadConfig:
             return
 
         if is_950():
-            raise ValueError("Sparse KV offload is not supported on 950PR&950DT Products")
+            logger.warning("EXPERIMENTAL: enable A5 packed-C8 Sparse Decode Offload")
 
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None and kv_transfer_config.has_connector("PreemptOffloadConnector"):

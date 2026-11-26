@@ -111,8 +111,8 @@ inline void npu_fused_quant_scatter_copy_sparse_flash_attention(
   TORCH_CHECK(std::isfinite(scale_value), "scale_value must be finite.");
 
   const auto device = query.device();
-  for (const auto* tensor : std::array<const at::Tensor*, 15>{
-           &query, &hbm_kv_bytes, &dram_kv_bytes, &hbm_block_table,
+  for (const auto* tensor : std::array<const at::Tensor*, 14>{
+           &query, &hbm_kv_bytes, &hbm_block_table,
            &dram_block_table, &topk_dst_slots, &topk_src_ids,
            &topk_miss_counts, &actual_seq_lengths_query,
            &actual_seq_lengths_kv, &num_cache_tokens, &miss_src_ids,
@@ -123,6 +123,11 @@ inline void npu_fused_quant_scatter_copy_sparse_flash_attention(
 
   // The same OpDef name is used for the HBM input and output, so ACLNN exposes
   // hbm_kv_bytes as one mutable Ref argument. Pass it only once here.
+  // Registered MemFabric memory is exposed as a non-owning CPU view.
+  // Swapped NPU DRAM remains supported for standalone operator tests.
+  TORCH_CHECK(dram_kv_bytes.device().is_cpu() || dram_kv_bytes.device() == device,
+              "DRAM source must be a registered host view or on the query NPU.");
+  TORCH_CHECK(dram_kv_bytes.is_contiguous(), "DRAM source must be contiguous.");
   EXEC_NPU_CMD(
       aclnnFusedQuantScatterCopySparseFlashAttention, query, hbm_kv_bytes,
       dram_kv_bytes, hbm_block_table, dram_block_table, topk_dst_slots,

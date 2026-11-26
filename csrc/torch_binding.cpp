@@ -3016,6 +3016,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
                  return at::from_blob(reinterpret_cast<void*>(ptr_val), shape, options);
              });
 
+    ops.def("sparse_kv_restore_int8_tensor(int ptr_val, int[] shape) -> Tensor");
+    ops.impl("sparse_kv_restore_int8_tensor", c10::DispatchKey::CompositeExplicitAutograd,
+             [](int64_t ptr_val, const std::vector<int64_t>& shape) {
+                 TORCH_CHECK(ptr_val != 0, "restore_int8_tensor requires a non-zero pointer");
+                 auto options = torch::TensorOptions().dtype(torch::kChar).device(torch::kCPU);
+                 return at::from_blob(reinterpret_cast<void*>(ptr_val), shape, options);
+             });
+
     ops.def("sparse_kv_restore_int16_tensor(int ptr_val, int[] shape) -> Tensor");
     ops.impl("sparse_kv_restore_int16_tensor", c10::DispatchKey::CompositeExplicitAutograd,
              [](int64_t ptr_val, const std::vector<int64_t>& shape) {

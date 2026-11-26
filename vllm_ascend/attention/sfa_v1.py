@@ -1888,7 +1888,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         DeviceOperator.scatter_cache(
             kv_cache[0].view(-1, packed_head_dim),
             slot_mapping_sfa[: packed_kv.shape[0]].view(-1, 1),
-            packed_kv,
+            packed_kv.view(kv_cache[0].dtype),
         )
 
     def _sync_pcp_kv_cache(self, kv_cache: tuple[torch.Tensor, ...], attn_metadata: M) -> None:
@@ -2009,7 +2009,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         # (k_npu, v_npu, k_cpu, v_cpu, topk_buffer_k, topk_buffer_v); the
         # attention kernels only consume the leading NPU pair.
         if len(main_cache) == OFFLOAD_KV_CACHE_TUPLE_LEN:
-            main_cache = (main_cache[OFFLOAD_K_CACHE_NPU_INDEX], main_cache[OFFLOAD_V_CACHE_NPU_INDEX])
+            if self.uses_packed_sfa_main_cache:
+                main_cache = (main_cache[OFFLOAD_K_CACHE_NPU_INDEX],)
+            else:
+                main_cache = (main_cache[OFFLOAD_K_CACHE_NPU_INDEX], main_cache[OFFLOAD_V_CACHE_NPU_INDEX])
 
         indexer_cache = self.indexer.k_cache.kv_cache
         if indexer_cache is None:

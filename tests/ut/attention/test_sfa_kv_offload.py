@@ -19,6 +19,8 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     FSA_EXTERNAL_PLAN_READY_MARKER,
     FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT,
     FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT,
+    SparseKVOffloadManager,
+    reshape_kv_cache_tensors_for_sparse_kv_offload,
 )
 
 
@@ -27,6 +29,7 @@ def test_exec_kv_offload_always_completes_compute_and_cache_write(defer_wait):
     impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
     k_nope, k_pe = torch.ones(2, 4), torch.ones(2, 2)
     impl._is_decode_only = MagicMock(return_value=True)
+    impl.enable_sparse_sfa_c8 = False
     impl._compute_kv_only = MagicMock(return_value=(k_nope, k_pe))
     impl._offload_layer_name = MagicMock(return_value="layer")
     impl._cpu_cache_pair = MagicMock(return_value=(torch.empty(1), torch.empty(1)))
@@ -509,3 +512,269 @@ def test_offload_attention_dispatch_after_removing_unfused_mode(mode):
         paged_attention.assert_not_called()
     assert impl._copy_sfa_attention.call_count == (mode == "copy_sfa")
     assert impl._execute_fused_overlap_offload_decode.call_count == (mode == "overlap")
+
+
+def test_pack_c8_kv_preserves_component_byte_order():
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.kv_lora_rank = 512
+    impl.qk_rope_head_dim = 64
+    nope = torch.arange(512, dtype=torch.int8).view(torch.float8_e4m3fn)
+    rope_bf16 = torch.arange(64, dtype=torch.bfloat16)
+    rope = rope_bf16.view(torch.float8_e4m3fn)
+    scale = torch.arange(16, dtype=torch.int8).view(torch.float8_e4m3fn)
+
+    packed = impl._pack_c8_kv(rope, nope, scale)
+
+    assert packed.dtype == torch.int8
+    assert tuple(packed.shape) == (1, 656)
+    torch.testing.assert_close(packed[0, :512], nope.view(torch.int8))
+    torch.testing.assert_close(packed[0, 512:640], rope_bf16.view(torch.int8))
+    torch.testing.assert_close(packed[0, 640:], scale.view(torch.int8))
+
+
+def test_c8_prefill_store_runs_at_post_projection_hook():
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.enable_sparse_sfa_c8 = True
+    impl._is_decode_only = MagicMock(return_value=False)
+    impl._offload_layer_name = MagicMock(return_value="layer")
+    impl._cpu_cache_pair = MagicMock(return_value=(object(), None))
+    impl._in_graph_runtime = MagicMock(return_value=False)
+    impl._copy_prefill_kv_to_copy_sfa_row = MagicMock()
+    result = (object(), object(), object())
+    cache = (torch.zeros(1, 128, 1, 656, dtype=torch.int8), None)
+    slots = torch.tensor([0])
+    metadata = SimpleNamespace()
+    with (
+        patch.object(AscendSFAImpl, "exec_kv", return_value=result),
+        patch.object(AscendSFAImpl, "_store_packed_kv_cache") as native_store,
+        patch("vllm_ascend.attention.sfa_kv_offload.get_sparse_kv_offload_manager") as get_manager,
+        patch(
+            "vllm_ascend.attention.sfa_kv_offload.get_ascend_config",
+            return_value=SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(keep_device_kv_cache=True)),
+        ),
+    ):
+        assert impl.exec_kv(None, None, None, cache, slots, metadata) is result
+        get_manager.return_value.offload_new_kv.assert_not_called()
+        impl._store_packed_kv_cache(result[0], result[1], result[2], cache, slots, metadata)
+
+    native_store.assert_called_once_with(result[0], result[1], result[2], cache, slots, metadata)
+    get_manager.return_value.offload_new_kv.assert_called_once()
+    assert get_manager.return_value.offload_new_kv.call_args.kwargs["has_prefill"] is True
+    impl._copy_prefill_kv_to_copy_sfa_row.assert_called_once()
+
+
+def test_c8_decode_store_hook_does_not_duplicate_current_kv_write():
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl._is_decode_only = MagicMock(return_value=True)
+    with (
+        patch.object(AscendSFAImpl, "_store_packed_kv_cache") as native_store,
+        patch("vllm_ascend.attention.sfa_kv_offload.get_sparse_kv_offload_manager") as get_manager,
+    ):
+        impl._store_packed_kv_cache(None, None, None, (None,), torch.tensor([0]), SimpleNamespace())
+    native_store.assert_not_called()
+    get_manager.assert_not_called()
+
+
+@pytest.mark.parametrize(("kv_len", "tail_rows"), [(3013, 197), (3072, 256)])
+def test_long_prefill_hot_fill_copies_both_circular_tail_blocks(kv_len, tail_rows):
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.use_fused_copy_sfa = True
+    impl.enable_sparse_sfa_c8 = True
+    impl.copy_sfa_hot_tokens = 2048
+    block_count = (kv_len + 127) // 128
+    paged = (torch.arange(block_count * 128 * 656, dtype=torch.int32) % 256).to(torch.int8).view(block_count, 128, 1, 656)
+    hot = torch.zeros(1, 2048 + 256, 1, 656, dtype=torch.int8)
+    manager = SimpleNamespace(
+        topk_buffers_k=[hot],
+        _get_offload_layer_id=MagicMock(return_value=0),
+    )
+    metadata = SimpleNamespace(
+        copy_sfa_prefill_pool_slots=torch.tensor([0]),
+        num_decodes=0,
+        num_prefills=1,
+        cum_query_lens=torch.tensor([kv_len]),
+        seq_lens=torch.tensor([kv_len]),
+        block_table=torch.arange(block_count, dtype=torch.int32).view(1, -1),
+    )
+    with patch(
+        "vllm_ascend.attention.sfa_kv_offload.get_ascend_config",
+        return_value=SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(keep_device_kv_cache=True)),
+    ):
+        impl._copy_prefill_kv_to_copy_sfa_row((paged, None), metadata, manager, "layer")
+
+    start = ((kv_len - 1) // 128 - 1) * 128
+    positions = torch.arange(start, kv_len)
+    expected_hot = torch.zeros(256, 656, dtype=torch.int8)
+    expected_hot[positions % 256] = paged.view(-1, 656)[positions]
+    torch.testing.assert_close(hot.view(-1, 656)[2048 : 2048 + 256], expected_hot)
+
+
+def test_copy_sfa_c8_uses_packed_memfabric_abi():
+    tokens, count, heads = 1, 1, 8
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.enable_sparse_sfa_c8 = True
+    impl.skip_topk = False
+    impl.lim_indexer_owner = impl
+    impl.kv_lora_rank = 512
+    impl.qk_rope_head_dim = 64
+    impl.scale = 1.0
+    impl.lim_topk_src = torch.zeros((tokens, 1, 2048), dtype=torch.int32)
+    impl.lim_topk_dst = torch.zeros_like(impl.lim_topk_src)
+    impl.lim_topk_misses = torch.zeros(tokens, dtype=torch.int32)
+    impl.lim_miss_src = torch.zeros((count, 32768), dtype=torch.int32)
+    impl.lim_miss_dst = torch.zeros_like(impl.lim_miss_src)
+    impl.lim_misses = torch.zeros(count, dtype=torch.int32)
+    manager = SimpleNamespace(
+        topk_buffers_k=[torch.zeros(1, 256, 1, 656, dtype=torch.int8)],
+        k_caches_cpu=[torch.zeros(1, 128, 1, 656, dtype=torch.int8)],
+        _get_offload_layer_id=MagicMock(return_value=0),
+    )
+    metadata = SimpleNamespace(
+        num_decode_tokens=tokens,
+        copy_sfa_pool_entries=torch.zeros(count, dtype=torch.int32),
+        copy_sfa_cache_tokens=torch.tensor([2048], dtype=torch.int32),
+        copy_sfa_logical_lens=torch.tensor([2048], dtype=torch.int32),
+        copy_sfa_query_ends=torch.tensor([1], dtype=torch.int32),
+        copy_sfa_hbm_block_table=torch.zeros((1, 2), dtype=torch.int32),
+        copy_sfa_source_block_table=torch.zeros((1, 1), dtype=torch.int32),
+    )
+    op = MagicMock()
+    with patch(
+        "vllm_ascend.attention.sfa_kv_offload.torch.ops._C_ascend",
+        SimpleNamespace(npu_fused_quant_scatter_copy_sparse_flash_attention=op),
+    ):
+        output = impl._copy_sfa_attention(
+            torch.zeros(tokens, heads, 512, dtype=torch.bfloat16),
+            torch.zeros(tokens, heads, 64, dtype=torch.bfloat16),
+            impl.lim_topk_src,
+            metadata,
+            manager,
+            "layer",
+        )
+
+    assert tuple(output.shape) == (tokens, heads, 512)
+    args = op.call_args.args
+    assert tuple(args[0].shape) == (tokens, heads, 576)
+    assert tuple(args[1].shape) == (1 * 256 // 128, 128, 1, 656)
+    assert args[2].device.type == "cpu"
+    assert tuple(args[2].shape) == (1, 128, 1, 656)
+    assert args[5].data_ptr() == impl.lim_topk_dst.data_ptr()
+    assert args[6].data_ptr() == impl.lim_topk_src.data_ptr()
+    assert tuple(args[11].shape) == (count, 1, 32768)
+    assert tuple(args[12].shape) == (count, 1, 32768)
+    assert tuple(args[15].shape) == (tokens, heads, 512)
+
+
+def test_reshape_sparse_offload_packed_c8_cache():
+    spec = SimpleNamespace(
+        cache_sparse_sfa_c8=True,
+        page_size_bytes=128 * 656,
+        block_size=128,
+        num_kv_heads=1,
+        head_size=656,
+    )
+    raw_npu = torch.zeros(2 * 128 * 656, dtype=torch.int8)
+    raw_host = torch.zeros_like(raw_npu)
+    hot = torch.zeros(1, 256, 1, 656, dtype=torch.int8)
+    with patch(
+        "vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager."
+        "allocate_kv_offload_topk_buffer_pair",
+        return_value=(hot, None),
+    ):
+        result = reshape_kv_cache_tensors_for_sparse_kv_offload(
+            (raw_npu, None, raw_host, None, raw_npu.numel()),
+            spec,
+            MagicMock(),
+            0,
+            SimpleNamespace(),
+            SimpleNamespace(),
+        )
+
+    assert result[0].shape == (2, 128, 1, 656)
+    assert result[2].shape == (2, 128, 1, 656)
+    assert result[0].dtype == result[2].dtype == torch.int8
+    assert result[1] is None and result[3] is None and result[5] is None
+    assert result[4] is hot
+
+
+def test_packed_c8_d2h_uses_one_656_byte_descriptor_per_token():
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.tp_rank = 0
+    manager.packed_c8 = True
+    manager.sparse_kv_offload_config = SimpleNamespace(keep_device_kv_cache=False)
+    manager.max_num_tokens = 2
+    manager.token_size_bytes_k = 656
+    manager.token_size_bytes_v = 0
+    manager.d2h_src_ptrs_npu = torch.zeros(4, dtype=torch.int64)
+    manager.d2h_dst_ptrs_npu = torch.zeros(4, dtype=torch.int64)
+    manager.d2h_lengths_npu = torch.zeros(4, dtype=torch.int32)
+    manager.d2h_size_npu = torch.zeros(1, dtype=torch.int32)
+    manager.d2h_token_indices_npu = torch.arange(2, dtype=torch.int64)
+    host = torch.zeros(4 * 128 * 656, dtype=torch.int8)
+    current = torch.zeros(2, 656, dtype=torch.int8)
+    slots = torch.tensor([0, 127], dtype=torch.int64)
+    calls = []
+
+    def sparse_copy(src, dst, lengths, count, device):
+        calls.append((src.clone(), dst.clone(), lengths.clone(), count.clone(), device))
+        return 0
+
+    with patch(
+        "vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager.offload",
+        SimpleNamespace(sparse_copy=sparse_copy),
+    ):
+        manager._offload_new_kv_on_current_stream(
+            slots,
+            host,
+            None,
+            None,
+            None,
+            current,
+            None,
+            False,
+        )
+
+    assert len(calls) == 1
+    _, dst, lengths, count, _ = calls[0]
+    assert int(count.item()) == 2
+    torch.testing.assert_close(lengths[:2], torch.tensor([656, 656], dtype=torch.int32))
+    torch.testing.assert_close(dst[:2], torch.tensor([host.data_ptr(), host.data_ptr() + 127 * 656]))
+
+
+def test_packed_c8_d2h_batches_65_descriptors_below_memfabric_limit():
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.tp_rank = 0
+    manager.packed_c8 = True
+    manager.sparse_kv_offload_config = SimpleNamespace(keep_device_kv_cache=True)
+    manager.max_num_tokens = 65
+    manager.token_size_bytes_k = 656
+    manager.token_size_bytes_v = 0
+    manager.d2h_src_ptrs_npu = torch.zeros(130, dtype=torch.int64)
+    manager.d2h_dst_ptrs_npu = torch.zeros(130, dtype=torch.int64)
+    manager.d2h_lengths_npu = torch.zeros(130, dtype=torch.int32)
+    manager.d2h_size_npu = torch.zeros(1, dtype=torch.int32)
+    manager.d2h_token_indices_npu = torch.arange(65, dtype=torch.int64)
+    host = torch.zeros(65 * 128 * 656, dtype=torch.int8)
+    current = torch.zeros(65, 656, dtype=torch.int8)  # noqa: F841
+    calls = []
+
+    def sparse_copy(src, dst, lengths, count, device):
+        calls.append(int(count.item()))
+        return 0
+
+    with patch(
+        "vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager.offload",
+        SimpleNamespace(sparse_copy=sparse_copy),
+    ):
+        manager._offload_new_kv_on_current_stream(
+            torch.arange(65),
+            host,
+            None,
+            host,
+            None,
+            None,
+            None,
+            True,
+        )
+
+    assert calls == [32, 32, 1]

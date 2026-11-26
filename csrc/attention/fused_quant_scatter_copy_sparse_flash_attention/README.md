@@ -30,7 +30,7 @@
 | --- | --- | --- | --- | --- |
 | query | 输入 | Query，shape为`[T, N, 576]`，其中`T`为Batch内所有请求的Query总数，`N`为Query Head数 | BFLOAT16、FLOAT16 | ND |
 | hbm_kv_bytes | 输入/输出 | HBM侧C8量化KV Cache，shape为`[block_num_hbm, 128, 1, 656]`；Scatter Copy结果原地写入该Tensor | INT8 | ND |
-| dram_kv_bytes | 输入 | DRAM侧C8量化KV Cache，shape为`[block_num_dram, 128, 1, 656]` | INT8 | ND |
+| dram_kv_bytes | 输入 | DRAM侧C8量化KV Cache，shape为`[block_num_dram, 128, 1, 656]`；支持NPU swapped memory，或MemFabric注册内存的非持有CPU视图，普通CPU内存不受支持 | INT8 | ND |
 | hbm_block_table | 输入 | HBM KV Cache的Page Attention块表，shape为`[B, max_block_num_hbm]` | INT32 | ND |
 | dram_block_table | 输入 | DRAM KV Cache的Page Attention块表，shape为`[B, max_block_num_dram]` | INT32 | ND |
 | topk_dst_slots | 输入 | 每个Query参与Attention的HBM token槽位，shape固定为`[T, 1, 2048]` | INT32 | ND |

@@ -48,6 +48,7 @@ from vllm_ascend.attention.sfa_v1 import (
     AscendSFAMetadata,
     AscendSFAMetadataBuilder,
     PreprocessType,
+    custom_kv_rmsnorm_rope,
 )
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -279,9 +280,12 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             (steps, requests, COPY_SFA_TAIL_BLOCKS), dtype=torch.int32, device=device
         )
         hf_config = vllm_config.model_config.hf_text_config
-        self.copy_sfa_token_bytes = torch.tensor(
-            [hf_config.kv_lora_rank * 2, hf_config.qk_rope_head_dim * 2], dtype=torch.int64, device=device
-        ).view(2, 1, 1)
+        if get_ascend_config().enable_sparse_sfa_c8:
+            self.copy_sfa_token_bytes = torch.tensor([656], dtype=torch.int64, device=device).view(1, 1, 1)
+        else:
+            self.copy_sfa_token_bytes = torch.tensor(
+                [hf_config.kv_lora_rank * 2, hf_config.qk_rope_head_dim * 2], dtype=torch.int64, device=device
+            ).view(2, 1, 1)
         copy_descriptors = requests * COPY_SFA_TAIL_BLOCKS * self.copy_sfa_token_bytes.numel()
         self.copy_sfa_copy_src_offsets = torch.empty((steps, copy_descriptors), dtype=torch.int64, device=device)
         self.copy_sfa_copy_dst_offsets = torch.empty_like(self.copy_sfa_copy_src_offsets)
@@ -525,9 +529,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             **kwargs,
         )
         if self.uses_packed_sfa_main_cache:
-            logger.warning(
-                "EXPERIMENTAL: packed C8 Sparse Decode guard bypassed; tensor integration is unverified"
-            )
+            logger.warning("EXPERIMENTAL: packed C8 Sparse Decode guard bypassed; tensor integration is unverified")
         self._current_layer_name: str | None = None
         self.block_size = self.vllm_config.cache_config.block_size
         self.use_fused_overlap = offload_cfg.use_fused_overlap
@@ -750,16 +752,24 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         """Bind immutable layer addresses after cache registration, before capture."""
         layer_id = manager._get_offload_layer_id(layer_name)
         device = manager.topk_buffers_k[layer_id].device
-        self.copy_sfa_host_bases = torch.tensor(
-            [manager.k_caches_cpu[layer_id].data_ptr(), manager.v_caches_cpu[layer_id].data_ptr()],
-            dtype=torch.int64,
-            device=device,
-        ).view(2, 1)
-        self.copy_sfa_device_bases = torch.tensor(
-            [manager.topk_buffers_k[layer_id].data_ptr(), manager.topk_buffers_v[layer_id].data_ptr()],
-            dtype=torch.int64,
-            device=device,
-        ).view(2, 1)
+        if self.enable_sparse_sfa_c8:
+            self.copy_sfa_host_bases = torch.tensor(
+                [manager.k_caches_cpu[layer_id].data_ptr()], dtype=torch.int64, device=device
+            ).view(1, 1)
+            self.copy_sfa_device_bases = torch.tensor(
+                [manager.topk_buffers_k[layer_id].data_ptr()], dtype=torch.int64, device=device
+            ).view(1, 1)
+        else:
+            self.copy_sfa_host_bases = torch.tensor(
+                [manager.k_caches_cpu[layer_id].data_ptr(), manager.v_caches_cpu[layer_id].data_ptr()],
+                dtype=torch.int64,
+                device=device,
+            ).view(2, 1)
+            self.copy_sfa_device_bases = torch.tensor(
+                [manager.topk_buffers_k[layer_id].data_ptr(), manager.topk_buffers_v[layer_id].data_ptr()],
+                dtype=torch.int64,
+                device=device,
+            ).view(2, 1)
 
     def compact_lim_topk_metadata(self, slot_ids: torch.Tensor) -> None:
         """Compact draft-step-0 LIM rows for direct reuse by later steps."""
@@ -778,18 +788,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         if reuse_indices and not self.has_indexer:
             raise RuntimeError("fused_copy_sfa shared indexer owner was not bound during model initialization")
         layer_id = manager._get_offload_layer_id(layer_name)
-        hbm_k = manager.topk_buffers_k[layer_id].view(-1, 128, 1, self.kv_lora_rank)
-        hbm_v = manager.topk_buffers_v[layer_id].view(-1, 128, 1, self.qk_rope_head_dim)
-        host_k = manager.k_caches_cpu[layer_id].view(-1, 128, self.kv_lora_rank)
-        host_v = manager.v_caches_cpu[layer_id].view(-1, 128, self.qk_rope_head_dim)
         if reuse_indices:
-            # The proposer compacts the complete step-0 LIM result alongside
-            # the shared logical TopK rows. All selected sources are resident
-            # after step 0, so later steps issue no cache copies. Short rows
-            # reuse their full dense extent (seq, zero budget); long rows the
-            # saved C budget.
             cache_tokens = self.copy_sfa_reuse_cache_tokens[:count]
-            logical_lens = self.copy_sfa_reuse_logical_lens[:count]  # exact saved selection; no extra tail
+            logical_lens = self.copy_sfa_reuse_logical_lens[:count]
             topk_misses = self.lim_reuse_topk_misses[:tokens]
             misses = self.lim_reuse_misses[:count]
         else:
@@ -799,6 +800,40 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             misses = owner.lim_misses[:count]
         heads = query.shape[1]
         q, qr = prepare_copy_sfa_queries(query[:tokens], query_rope[:tokens])
+
+        if self.enable_sparse_sfa_c8:
+            packed_query = torch.cat([q, qr], dim=-1).contiguous()
+            hbm_packed = manager.topk_buffers_k[layer_id].view(-1, 128, 1, 656).view(torch.int8)
+            host_packed = manager.k_caches_cpu[layer_id].view(torch.int8)
+            out = torch.empty(
+                (*packed_query.shape[:-1], self.kv_lora_rank),
+                dtype=packed_query.dtype,
+                device=packed_query.device,
+            )
+            torch.ops._C_ascend.npu_fused_quant_scatter_copy_sparse_flash_attention(
+                packed_query,
+                hbm_packed,
+                host_packed,
+                metadata.copy_sfa_hbm_block_table,
+                metadata.copy_sfa_source_block_table,
+                owner.lim_topk_dst[:tokens],
+                owner.lim_topk_src[:tokens],
+                topk_misses,
+                metadata.copy_sfa_query_ends,
+                logical_lens,
+                cache_tokens,
+                owner.lim_miss_src[:count].unsqueeze(1),
+                owner.lim_miss_dst[:count].unsqueeze(1),
+                misses,
+                float(self.scale),
+                out,
+            )
+            return out[:, :heads].contiguous()
+
+        hbm_k = manager.topk_buffers_k[layer_id].view(-1, 128, 1, self.kv_lora_rank)
+        hbm_v = manager.topk_buffers_v[layer_id].view(-1, 128, 1, self.qk_rope_head_dim)
+        host_k = manager.k_caches_cpu[layer_id].view(-1, 128, self.kv_lora_rank)
+        host_v = manager.v_caches_cpu[layer_id].view(-1, 128, self.qk_rope_head_dim)
         out = torch.empty_like(q)
         torch.ops._C_ascend.npu_fused_scatter_copy_sparse_flash_attention(
             qr,
@@ -828,13 +863,29 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         kv_no_split: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Decode-only KV generation that never touches an NPU paged cache."""
+    ) -> tuple[torch.Tensor, ...]:
+        """Decode-only KV generation without a full NPU paged main cache."""
         B = kv_no_split.shape[0]
         N = self.num_kv_heads
         S = 1
         assert self.kv_a_layernorm is not None, "kv_a_layernorm must be initialized"
         kv_no_split = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
+        if self.enable_sparse_sfa_c8:
+            k_pe, k_nope, knope_scale = custom_kv_rmsnorm_rope(
+                kv_no_split,
+                self.kv_a_layernorm.weight,
+                cos,
+                sin,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                epsilon=self.kv_a_layernorm.variance_epsilon,
+                dst_type=self.c8_cache_dtype,
+                tile_size=self.sfa_qsfa_tile_size,
+                use_rope=self.use_rope,
+            )
+            # Keep the decode-only helper's (NOPE, RoPE, scale) contract;
+            # custom_kv_rmsnorm_rope itself returns (RoPE, NOPE, scale).
+            return k_nope, k_pe, knope_scale
         rms_in, rope_in = kv_no_split.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_nope_flat, _ = torch_npu.npu_rms_norm(
             rms_in.view(-1, self.kv_lora_rank),
@@ -848,6 +899,50 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             sin,
         )
         return k_nope, k_pe
+
+    def _pack_c8_kv(self, k_pe: torch.Tensor, k_nope: torch.Tensor, knope_scale: torch.Tensor) -> torch.Tensor:
+        """Pack FP8 NOPE, BF16 RoPE and FP32 scale bytes into 656-byte rows."""
+        if k_nope.numel() % self.kv_lora_rank != 0:
+            raise RuntimeError(
+                "Unexpected C8 component layout: "
+                f"k_nope={tuple(k_nope.shape)}/{k_nope.dtype}, "
+                f"k_pe={tuple(k_pe.shape)}/{k_pe.dtype}, "
+                f"scale={tuple(knope_scale.shape)}/{knope_scale.dtype}, "
+                f"kv_lora_rank={self.kv_lora_rank}"
+            )
+        packed = torch.cat(
+            [
+                k_nope.reshape(-1, self.kv_lora_rank),
+                k_pe.reshape(-1, self.qk_rope_head_dim * 2),
+                knope_scale.reshape(-1, 16),
+            ],
+            dim=-1,
+        ).contiguous()
+        if packed.shape[-1] != 656:
+            raise RuntimeError(f"A5 Copy-SFA requires 656-byte packed KV, got {packed.shape[-1]}")
+        return packed.view(torch.int8)
+
+    def _store_packed_kv_cache(self, k_pe, k_nope, knope_scale, kv_cache, slot_mapping_sfa, attn_metadata) -> None:
+        """Finish packed prefill writes at the native post-q-projection hook."""
+        if self._is_decode_only(attn_metadata):
+            return
+        super()._store_packed_kv_cache(k_pe, k_nope, knope_scale, kv_cache, slot_mapping_sfa, attn_metadata)
+        manager = get_sparse_kv_offload_manager()
+        layer_name = self._offload_layer_name()
+        k_cache_cpu, v_cache_cpu = self._cpu_cache_pair(manager, layer_name)
+        manager.offload_new_kv(
+            layer_name=layer_name,
+            slot_mapping=slot_mapping_sfa,
+            k_cache_cpu=k_cache_cpu,
+            v_cache_cpu=v_cache_cpu,
+            k_cache_npu=kv_cache[0],
+            v_cache_npu=None,
+            k=None,
+            v=None,
+            has_prefill=True,
+            capturing=self._in_graph_runtime(),
+        )
+        self._copy_prefill_kv_to_copy_sfa_row(kv_cache, attn_metadata, manager, layer_name)
 
     def exec_kv(
         self,
@@ -863,12 +958,35 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         # Offload completes synchronously, including cache writes and CPU commits.
         attn_metadata = cast(AscendSFAOffloadMetadata, attn_metadata)
         if self._is_decode_only(attn_metadata):
-            k_nope, k_pe = self._compute_kv_only(kv_no_split, cos, sin)
+            kv_outputs = self._compute_kv_only(kv_no_split, cos, sin)
+            k_nope, k_pe = kv_outputs[:2]
+            knope_scale = kv_outputs[2] if len(kv_outputs) == 3 else None
             manager = get_sparse_kv_offload_manager()
             layer_name = self._offload_layer_name()
             k_cache_cpu, v_cache_cpu = self._cpu_cache_pair(manager, layer_name)
+            layer_id = manager._get_offload_layer_id(layer_name)
+            if self.enable_sparse_sfa_c8:
+                assert knope_scale is not None
+                packed = self._pack_c8_kv(k_pe, k_nope, knope_scale)
+                if attn_metadata.fused_copy_sfa_enabled:
+                    device_slots = attn_metadata.copy_sfa_device_slots
+                    assert device_slots is not None
+                    hot = manager.topk_buffers_k[layer_id]
+                    hot.view(-1, 656).index_copy_(0, device_slots[: packed.shape[0]], packed)
+                manager.offload_new_kv(
+                    layer_name=layer_name,
+                    slot_mapping=slots,
+                    k_cache_cpu=k_cache_cpu,
+                    v_cache_cpu=None,
+                    k_cache_npu=None,
+                    v_cache_npu=None,
+                    k=packed,
+                    v=None,
+                    has_prefill=False,
+                    capturing=self._in_graph_runtime(),
+                )
+                return k_pe, k_nope, knope_scale
             if attn_metadata.fused_copy_sfa_enabled:
-                layer_id = manager._get_offload_layer_id(layer_name)
                 device_slots = attn_metadata.copy_sfa_device_slots
                 assert device_slots is not None
                 for cache_tensor, value in (
@@ -896,6 +1014,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         # shared CPU pool.
         _check_device_kv_cache_exist()
         result = super().exec_kv(kv_no_split, cos, sin, kv_cache, slots, attn_metadata)
+        if self.enable_sparse_sfa_c8:
+            return result
         manager = get_sparse_kv_offload_manager()
         layer_name = self._offload_layer_name()
         k_cache_cpu, v_cache_cpu = self._cpu_cache_pair(manager, layer_name)
@@ -946,7 +1066,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             start = kv_len - q_len  # this batch's new tokens [start, kv_len)
             is_short = kv_len <= hot
             if not is_short:
-                start = max(start, (kv_len // LIM_CACHE_BLOCK_SIZE) * LIM_CACHE_BLOCK_SIZE)  # long: tail block only
+                start = max(start, ((kv_len - 1) // LIM_CACHE_BLOCK_SIZE - 1) * LIM_CACHE_BLOCK_SIZE)  # long: two tail blocks
             if start >= kv_len:
                 continue
             positions = torch.arange(start, kv_len, dtype=torch.int64, device=device)
@@ -956,12 +1076,18 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             )
             row_base = int(pool_slots[row]) * stride_tokens
             dst = row_base + (positions if is_short else hot + positions % COPY_SFA_TAIL_TOKENS)
-            for paged, buffers in (
-                (kv_cache[0], manager.topk_buffers_k),
-                (kv_cache[1], manager.topk_buffers_v),
-            ):
+
+            cache_planes = (
+                ((kv_cache[0], manager.topk_buffers_k),)
+                if self.enable_sparse_sfa_c8
+                else ((kv_cache[0], manager.topk_buffers_k), (kv_cache[1], manager.topk_buffers_v))
+            )
+            for paged, buffers in cache_planes:
                 rows = buffers[layer_id].view(-1, buffers[layer_id].shape[-1])
-                rows.index_copy_(0, dst, paged.view(-1, paged.shape[-1]).index_select(0, src))
+                # index_select does not implement FP8. The prefill hot-row
+                # fill is a byte copy, so use the same storage as INT8.
+                paged_bytes = paged.view(torch.int8) if self.enable_sparse_sfa_c8 else paged
+                rows.index_copy_(0, dst, paged_bytes.view(-1, paged_bytes.shape[-1]).index_select(0, src))
 
     @staticmethod
     def _flatten_pa_cache(cache: torch.Tensor) -> torch.Tensor:
@@ -1592,6 +1718,10 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         if num_decode_tokens == 0 or not self.use_fused_overlap:
             # Prefill/mixed Copy-SFA debug batches retain the full device KV.
             _check_device_kv_cache_exist()
+            if getattr(self, "enable_sparse_sfa_c8", False):
+                # Storage and scatter/copy use INT8; native QSFA requires an
+                # FP8-typed packed cache view over the same bytes.
+                kv_cache = (kv_cache[0].view(torch.float8_e4m3fn), *kv_cache[1:])
             return super()._execute_sparse_flash_attention_process(
                 ql_nope,
                 q_pe,
