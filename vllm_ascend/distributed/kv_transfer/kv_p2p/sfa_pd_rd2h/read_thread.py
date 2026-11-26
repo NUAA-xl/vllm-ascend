@@ -534,21 +534,23 @@ class MembPullReadThread(threading.Thread):
         p_block_len = p_meta["block_len"]
         p_block_size_scale = p_meta.get("block_size_scale", [1] * len(p_base_addrs))
         main_tensor_count = int(p_meta.get("main_tensor_count", 2))
-        if main_tensor_count != 2 or len(p_base_addrs) < main_tensor_count:
-            raise RuntimeError(
-                f"MembPull P metadata for {layer_name} must expose two main K/V "
-                f"tensors, got main_tensor_count={main_tensor_count}, "
-                f"total={len(p_base_addrs)}"
-            )
-        p_has_indexer = bool(p_meta.get("has_indexer", len(p_base_addrs) > main_tensor_count))
-
         try:
             k_cpu_ptr, v_cpu_ptr = state.main_gva_bases[offload_id]
             d_k_len, d_v_len = state.main_block_lens[offload_id]
         except IndexError as error:
             raise RuntimeError(f"MembPull shared CPU pool metadata is missing for {layer_name}") from error
+        packed_c8 = d_v_len == 0
+        expected_main_count = 1 if packed_c8 else 2
+        if main_tensor_count != expected_main_count or len(p_base_addrs) < main_tensor_count:
+            layout = "one packed-C8 tensor" if packed_c8 else "two main K/V tensors"
+            raise RuntimeError(
+                f"MembPull P metadata for {layer_name} must expose {layout}, "
+                f"got main_tensor_count={main_tensor_count}, total={len(p_base_addrs)}"
+            )
+        p_has_indexer = bool(p_meta.get("has_indexer", len(p_base_addrs) > main_tensor_count))
+
         p_k_len = p_block_len[0] * p_block_size_scale[0]
-        p_v_len = p_block_len[1] * p_block_size_scale[1]
+        p_v_len = 0 if packed_c8 else p_block_len[1] * p_block_size_scale[1]
         if (p_k_len, p_v_len) != (d_k_len, d_v_len):
             raise RuntimeError(
                 f"MembPull main KV layout mismatch for {layer_name}: P=({p_k_len}, {p_v_len}), D=({d_k_len}, {d_v_len})"
@@ -617,9 +619,10 @@ class MembPullReadThread(threading.Thread):
             "pool_idx": pool_idx,
             "offload_id": offload_id,
             "p_k_base": p_base_addrs[0],
-            "p_v_base": p_base_addrs[1],
+            "p_v_base": None if packed_c8 else p_base_addrs[1],
             "p_k_len": p_block_len[0] * p_block_size_scale[0],
-            "p_v_len": p_block_len[1] * p_block_size_scale[1],
+            "p_v_len": p_v_len,
+            "packed_c8": packed_c8,
             "k_cpu_ptr": k_cpu_ptr,
             "v_cpu_ptr": v_cpu_ptr,
             "indexer": indexer,
@@ -671,7 +674,7 @@ class MembPullReadThread(threading.Thread):
         tail = state.copy_sfa_tail_by_req.get(ext_req_id)
         if tail is None or tail.tail_tokens <= 0:
             return
-        if not state.topk_k_bases or not state.topk_v_bases:
+        if not state.topk_k_bases or (not layer.get("packed_c8", False) and not state.topk_v_bases):
             return
         if state.block_size <= 0 or state.topk_row_tokens <= 0:
             return
@@ -679,7 +682,7 @@ class MembPullReadThread(threading.Thread):
         if local_idx < 0 or local_idx >= len(p_main_block_ids):
             return
         offload_id = layer["offload_id"]
-        if offload_id >= len(state.topk_k_bases) or offload_id >= len(state.topk_v_bases):
+        if offload_id >= len(state.topk_k_bases) or (not layer.get("packed_c8", False) and offload_id >= len(state.topk_v_bases)):
             raise RuntimeError(f"MembPull fused_copy_sfa tail is missing topk buffer bases for {layer['layer_name']}")
         p_k_len = int(layer["p_k_len"])
         p_v_len = int(layer["p_v_len"])
@@ -693,27 +696,32 @@ class MembPullReadThread(threading.Thread):
         ring_offset = (tail.tail_block_index % 2) * state.block_size
         dst_token = tail.pool_slot * state.topk_row_tokens + state.topk_hot_tokens + ring_offset
         p_block_id = int(p_main_block_ids[local_idx])
-        peer = np.array(
-            [
-                int(layer["p_k_base"]) + p_block_id * p_k_len,
-                int(layer["p_v_base"]) + p_block_id * p_v_len,
-            ],
-            dtype=np.int64,
-        )
-        local = np.array(
-            [
-                state.topk_k_bases[offload_id] + dst_token * token_bytes_k,
-                state.topk_v_bases[offload_id] + dst_token * token_bytes_v,
-            ],
-            dtype=np.int64,
-        )
-        length = np.array(
-            [tail.tail_tokens * token_bytes_k, tail.tail_tokens * token_bytes_v],
-            dtype=np.int64,
-        )
-        peer_chunks.append(peer)
-        local_chunks.append(local)
-        length_chunks.append(length)
+        if layer.get("packed_c8", False):
+            peer_chunks.append(np.array([int(layer["p_k_base"]) + p_block_id * p_k_len], dtype=np.int64))
+            local_chunks.append(np.array([state.topk_k_bases[offload_id] + dst_token * token_bytes_k], dtype=np.int64))
+            length_chunks.append(np.array([tail.tail_tokens * token_bytes_k], dtype=np.int64))
+        else:
+            peer = np.array(
+                [
+                    int(layer["p_k_base"]) + p_block_id * p_k_len,
+                    int(layer["p_v_base"]) + p_block_id * p_v_len,
+                ],
+                dtype=np.int64,
+            )
+            local = np.array(
+                [
+                    state.topk_k_bases[offload_id] + dst_token * token_bytes_k,
+                    state.topk_v_bases[offload_id] + dst_token * token_bytes_v,
+                ],
+                dtype=np.int64,
+            )
+            length = np.array(
+                [tail.tail_tokens * token_bytes_k, tail.tail_tokens * token_bytes_v],
+                dtype=np.int64,
+            )
+            peer_chunks.append(peer)
+            local_chunks.append(local)
+            length_chunks.append(length)
 
     def _append_copy_sfa_dense_descriptors(
         self,
@@ -730,7 +738,7 @@ class MembPullReadThread(threading.Thread):
         dest = state.copy_sfa_tail_by_req.get(ext_req_id)
         if dest is None or not dest.dense or dest.kv_tokens <= 0:
             return
-        if not state.topk_k_bases or not state.topk_v_bases:
+        if not state.topk_k_bases or (not layer.get("packed_c8", False) and not state.topk_v_bases):
             return
         if state.block_size <= 0 or state.topk_row_tokens <= 0:
             return
@@ -740,7 +748,7 @@ class MembPullReadThread(threading.Thread):
                 f"kv_tokens={dest.kv_tokens}, hot={state.topk_row_tokens - 2 * state.block_size}"
             )
         offload_id = layer["offload_id"]
-        if offload_id >= len(state.topk_k_bases) or offload_id >= len(state.topk_v_bases):
+        if offload_id >= len(state.topk_k_bases) or (not layer.get("packed_c8", False) and offload_id >= len(state.topk_v_bases)):
             raise RuntimeError(f"MembPull fused_copy_sfa dense is missing topk buffer bases for {layer['layer_name']}")
         p_k_len = int(layer["p_k_len"])
         p_v_len = int(layer["p_v_len"])
@@ -767,10 +775,12 @@ class MembPullReadThread(threading.Thread):
         dst_blocks = np.arange(start, end, dtype=np.int64)
         dst_tokens = dest.pool_slot * state.topk_row_tokens + dst_blocks * state.block_size
         partial = np.minimum(dest.kv_tokens - dst_blocks * state.block_size, state.block_size)
-        for p_base, p_block_len, token_bytes, topk_base in (
+        components = [
             (int(layer["p_k_base"]), p_k_len, token_bytes_k, state.topk_k_bases[offload_id]),
-            (int(layer["p_v_base"]), p_v_len, token_bytes_v, state.topk_v_bases[offload_id]),
-        ):
+        ]
+        if not layer.get("packed_c8", False):
+            components.append((int(layer["p_v_base"]), p_v_len, token_bytes_v, state.topk_v_bases[offload_id]))
+        for p_base, p_block_len, token_bytes, topk_base in components:
             # P-side blocks are not contiguous; _coalesce_desc merges only the
             # opportunistically contiguous runs in both address spaces.
             cp, cl, coalesced_lengths = _coalesce_desc(
@@ -855,7 +865,11 @@ class MembPullReadThread(threading.Thread):
 
         # Main MLA is replicated across P ranks and already split across D TP; only the
         # group's first contributor pulls it, so it is neither duplicated nor fine-split.
-        pull_main = layer["k_cpu_ptr"] is not None and layer["v_cpu_ptr"] is not None and group_member_idx == 0
+        pull_main = (
+            layer["k_cpu_ptr"] is not None
+            and (layer.get("packed_c8", False) or layer["v_cpu_ptr"] is not None)
+            and group_member_idx == 0
+        )
         if pull_main and len(p_main_block_ids) != len(d_main_ids):
             raise RuntimeError(
                 f"MembPull main block count mismatch for req {ext_req_id}: "
@@ -884,14 +898,15 @@ class MembPullReadThread(threading.Thread):
             peer_chunks.append(cp)
             local_chunks.append(cl)
             length_chunks.append(coalesced_lengths)
-            cp, cl, coalesced_lengths = _coalesce_desc(
-                p_v_base + p_main * p_v_len,
-                layer["v_cpu_ptr"] + d_main * p_v_len,
-                len_v,
-            )
-            peer_chunks.append(cp)
-            local_chunks.append(cl)
-            length_chunks.append(coalesced_lengths)
+            if not layer.get("packed_c8", False):
+                cp, cl, coalesced_lengths = _coalesce_desc(
+                    p_v_base + p_main * p_v_len,
+                    layer["v_cpu_ptr"] + d_main * p_v_len,
+                    len_v,
+                )
+                peer_chunks.append(cp)
+                local_chunks.append(cl)
+                length_chunks.append(coalesced_lengths)
 
         idx = layer["indexer"]
         if idx is not None and len(p_indexer_block_ids) != len(d_indexer_ids):
@@ -1080,7 +1095,7 @@ class MembPullReadThread(threading.Thread):
                 owns_requested_main = (
                     group_member_idx == 0
                     and layer["k_cpu_ptr"] is not None
-                    and layer["v_cpu_ptr"] is not None
+                    and (layer.get("packed_c8", False) or layer["v_cpu_ptr"] is not None)
                     and owned_main_end > owned_main_start
                 )
                 owns_requested_indexer = (

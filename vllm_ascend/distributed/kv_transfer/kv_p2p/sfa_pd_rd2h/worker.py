@@ -509,12 +509,13 @@ class SFAPDRD2HConsumerWorker:
             cpu_pool = self._cpu_pools[pool_idx]
             if cpu_pool is not None:
                 k_cpu, v_cpu = cpu_pool
-                addrs = [k_cpu.data_ptr(), v_cpu.data_ptr()]
-                block_lens = [
-                    k_cpu.element_size() * math.prod(k_cpu.shape[1:]),
-                    v_cpu.element_size() * math.prod(v_cpu.shape[1:]),
-                ]
-                scales = [k_cpu.shape[0] // num_blocks, v_cpu.shape[0] // num_blocks]
+                addrs = [k_cpu.data_ptr()]
+                block_lens = [k_cpu.element_size() * math.prod(k_cpu.shape[1:])]
+                scales = [k_cpu.shape[0] // num_blocks]
+                if v_cpu is not None:
+                    addrs.append(v_cpu.data_ptr())
+                    block_lens.append(v_cpu.element_size() * math.prod(v_cpu.shape[1:]))
+                    scales.append(v_cpu.shape[0] // num_blocks)
             else:
                 addrs, block_lens, scales = [], [], []
             groups = [main_group_idx] * len(addrs)
@@ -533,7 +534,7 @@ class SFAPDRD2HConsumerWorker:
                 kv_caches_base_addr=addrs,
                 block_len=block_lens,
                 block_size_scale=scales,
-                main_tensor_count=2 if cpu_pool is not None else 0,
+                main_tensor_count=len(addrs),
                 has_indexer=indexer_t is not None,
             )
 
@@ -576,10 +577,12 @@ class SFAPDRD2HConsumerWorker:
 
         topk_k = manager.topk_buffers_k
         topk_v = manager.topk_buffers_v
-        if not topk_k or not topk_v:
+        if not topk_k:
             raise RuntimeError("fused_copy_sfa PD tail D2D requires registered topk buffers")
         self._topk_k_bases = [int(tensor.data_ptr()) for tensor in topk_k]
-        self._topk_v_bases = [int(tensor.data_ptr()) for tensor in topk_v]
+        self._topk_v_bases = [] if topk_v is None or all(tensor is None for tensor in topk_v) else [
+            int(tensor.data_ptr()) for tensor in topk_v
+        ]
         self._copy_sfa_block_size = int(manager.block_size)
         self._topk_row_tokens = int(topk_k[0].shape[1])
         self._topk_hot_tokens = self._topk_row_tokens - COPY_SFA_TAIL_BLOCKS * self._copy_sfa_block_size
@@ -811,6 +814,8 @@ class SFAPDRD2HProducerWorker:
             if not isinstance(cache_or_caches, (list, tuple)):
                 cache_or_caches = (cache_or_caches,)
             for single_kv_cache in cache_or_caches:
+                if single_kv_cache is None:
+                    continue
                 tensor_num_blocks = single_kv_cache.shape[0]
                 if tensor_num_blocks % num_blocks != 0:
                     raise ValueError("The external block size must be an integer multiple of the kernel block size.")
@@ -823,9 +828,12 @@ class SFAPDRD2HProducerWorker:
             layer_meta = LayerMetadata([], [], [], [])
             _append_cache_tensors(layer_meta, target_caches[main_name], layer2group_ids[main_name])
             layer_meta.main_tensor_count = len(layer_meta.kv_caches_base_addr)
-            if layer_meta.main_tensor_count != 2:
+            packed_c8 = any(bool(getattr(spec, "cache_sparse_sfa_c8", False)) for spec in self.kv_cache_specs)
+            expected_main_count = 1 if packed_c8 else 2
+            if layer_meta.main_tensor_count != expected_main_count:
+                layout = "one packed-C8 tensor" if packed_c8 else "main K/V tensors"
                 raise RuntimeError(
-                    f"SFAPD producer layer {main_name} must expose main K/V tensors, "
+                    f"SFAPD producer layer {main_name} must expose {layout}, "
                     f"got {layer_meta.main_tensor_count} tensor(s)"
                 )
             indexer_name = indexer_by_layer.get(physical_idx)
