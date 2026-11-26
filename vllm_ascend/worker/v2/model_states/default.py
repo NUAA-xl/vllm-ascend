@@ -614,7 +614,10 @@ class AscendModelState(DefaultModelState):
         if restore_copy_sfa_tails:
             manager = get_sparse_kv_offload_manager()
             for metadata in self.attn_metadata.values():
-                if getattr(metadata, "copy_sfa_copy_src_offsets", None) is not None:
+                if (
+                    not getattr(metadata, "copy_sfa_skip_tail_restore", False)
+                    and getattr(metadata, "copy_sfa_copy_src_offsets", None) is not None
+                ):
                     manager.restore_copy_sfa_tails(metadata)
                     break
         return self.attn_metadata

@@ -307,6 +307,9 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         metadata.num_decode_tokens = num_decode_tokens
         metadata.req_ids_tensor = common_attn_metadata.req_ids_tensor
         metadata.token_to_req = common_attn_metadata.token_to_req
+        metadata.copy_sfa_skip_tail_restore = self.is_pd_decode_consumer and bool(
+            getattr(common_attn_metadata, "offload_dummy", False)
+        )
         metadata.fused_copy_sfa_enabled = (
             self.use_fused_copy_sfa
             and (num_prefills == 0 or common_attn_metadata.offload_dummy)
@@ -752,6 +755,17 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         """Bind immutable layer addresses after cache registration, before capture."""
         layer_id = manager._get_offload_layer_id(layer_name)
         device = manager.topk_buffers_k[layer_id].device
+        if self.enable_sparse_sfa_c8 and self.copy_sfa_host_bases is not None:
+            host_ptr = manager.k_caches_cpu[layer_id].data_ptr()
+            device_ptr = manager.topk_buffers_k[layer_id].data_ptr()
+            if (
+                self.copy_sfa_host_bases.numel() != 1
+                or self.copy_sfa_device_bases.numel() != 1
+                or self.copy_sfa_host_bases[0, 0].item() != host_ptr
+                or self.copy_sfa_device_bases[0, 0].item() != device_ptr
+            ):
+                raise RuntimeError(f"packed-C8 host/hot base changed after binding: layer={layer_name}")
+            return
         if self.enable_sparse_sfa_c8:
             self.copy_sfa_host_bases = torch.tensor(
                 [manager.k_caches_cpu[layer_id].data_ptr()], dtype=torch.int64, device=device

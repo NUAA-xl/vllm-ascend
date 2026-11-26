@@ -665,6 +665,58 @@ def test_copy_sfa_c8_uses_packed_memfabric_abi():
     assert tuple(args[15].shape) == (tokens, heads, 512)
 
 
+def test_c8_bind_is_idempotent_and_rejects_changed_bases():
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.enable_sparse_sfa_c8 = True
+    impl.copy_sfa_host_bases = None
+    impl.copy_sfa_device_bases = None
+    manager = SimpleNamespace(
+        k_caches_cpu=[torch.zeros(1, 128, 1, 656, dtype=torch.int8)],
+        topk_buffers_k=[torch.zeros(1, 256, 1, 656, dtype=torch.int8)],
+        _get_offload_layer_id=MagicMock(return_value=0),
+    )
+    impl.bind_copy_sfa_kv_cache(manager, "layer")
+    host_bases = impl.copy_sfa_host_bases
+    device_bases = impl.copy_sfa_device_bases
+    impl.bind_copy_sfa_kv_cache(manager, "layer")
+    assert impl.copy_sfa_host_bases is host_bases
+    assert impl.copy_sfa_device_bases is device_bases
+    manager.k_caches_cpu[0] = torch.zeros(1, 128, 1, 656, dtype=torch.int8)
+    with pytest.raises(RuntimeError, match="base changed"):
+        impl.bind_copy_sfa_kv_cache(manager, "layer")
+
+
+def test_c8_graph_marks_only_pd_dummy_replay_to_skip_tail_restore():
+    builder = AscendSFAKVOffloadMetadataBuilder.__new__(AscendSFAKVOffloadMetadataBuilder)
+    builder.use_fused_copy_sfa = False
+    builder.is_pd_decode_consumer = True
+    builder.decode_threshold = 1
+    common = SimpleNamespace(offload_dummy=True, req_ids_tensor=None, token_to_req=None, max_query_len=1)
+    metadata_kwargs = dict(
+        num_actual_tokens=1,
+        slot_mapping=torch.tensor([0]),
+        seq_lens=torch.tensor([1]),
+        seq_lens_cpu=torch.tensor([1]),
+        cum_query_lens=torch.tensor([1]),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        sin=torch.zeros(1),
+        cos=torch.zeros(1),
+    )
+    with patch(
+        "vllm_ascend.attention.sfa_kv_offload.split_decodes_and_prefills",
+        return_value=(0, 0, 0, 0),
+    ):
+        metadata = builder._populate_offload_metadata(AscendSFAOffloadMetadata(**metadata_kwargs), common)
+    assert metadata.copy_sfa_skip_tail_restore is True
+    common.offload_dummy = False
+    with patch(
+        "vllm_ascend.attention.sfa_kv_offload.split_decodes_and_prefills",
+        return_value=(0, 0, 0, 0),
+    ):
+        metadata = builder._populate_offload_metadata(AscendSFAOffloadMetadata(**metadata_kwargs), common)
+    assert metadata.copy_sfa_skip_tail_restore is False
+
+
 def test_c8_mtp_reuse_requires_step0_selection():
     impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
     impl.enable_sparse_sfa_c8 = True
