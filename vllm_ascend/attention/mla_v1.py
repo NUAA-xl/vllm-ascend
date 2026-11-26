@@ -186,7 +186,8 @@ class AscendMLAAttention(MLAAttention):
             cache_sparse_sfa_turboquant=use_sfa_turboquant,
             cache_sparse_sfa_c8=use_sfa_c8,
             store_on_host=(
-                not (spec.is_draft or self.is_draft_layer) and getattr(self.impl, "store_kv_cache_on_host", False)
+                (not (spec.is_draft or self.is_draft_layer) or use_sfa_c8)
+                and getattr(self.impl, "store_kv_cache_on_host", False)
             ),
             head_size=head_size,
             dtype=dtype,

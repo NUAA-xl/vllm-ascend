@@ -665,6 +665,120 @@ def test_copy_sfa_c8_uses_packed_memfabric_abi():
     assert tuple(args[15].shape) == (tokens, heads, 512)
 
 
+def test_c8_mtp_reuse_requires_step0_selection():
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.enable_sparse_sfa_c8 = True
+    impl.skip_topk = True
+    impl.has_indexer = True
+    impl.lim_indexer_owner = impl
+    impl.lim_reuse_request_count = 0
+    with pytest.raises(RuntimeError, match="draft-step-0"):
+        impl._copy_sfa_attention(
+            None,
+            None,
+            None,
+            SimpleNamespace(num_decode_tokens=1, copy_sfa_pool_entries=torch.zeros(1, dtype=torch.int32)),
+            SimpleNamespace(),
+            "layer",
+        )
+
+
+def test_c8_mtp_reuses_step0_lengths_and_miss_counts():
+    tokens, count, heads = 1, 1, 8
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.enable_sparse_sfa_c8 = True
+    impl.skip_topk = True
+    impl.has_indexer = True
+    impl.lim_indexer_owner = impl
+    impl.lim_reuse_request_count = 1
+    impl.kv_lora_rank = 512
+    impl.qk_rope_head_dim = 64
+    impl.scale = 1.0
+    impl.lim_topk_src = torch.zeros((tokens, 1, 2048), dtype=torch.int32)
+    impl.lim_topk_dst = torch.zeros_like(impl.lim_topk_src)
+    impl.lim_miss_src = torch.zeros((count, 32768), dtype=torch.int32)
+    impl.lim_miss_dst = torch.zeros_like(impl.lim_miss_src)
+    impl.copy_sfa_reuse_cache_tokens = torch.tensor([1024], dtype=torch.int32)
+    impl.copy_sfa_reuse_logical_lens = torch.tensor([1025], dtype=torch.int32)
+    impl.lim_reuse_topk_misses = torch.tensor([7], dtype=torch.int32)
+    impl.lim_reuse_misses = torch.tensor([8], dtype=torch.int32)
+    manager = SimpleNamespace(
+        topk_buffers_k=[torch.zeros(1, 256, 1, 656, dtype=torch.int8)],
+        k_caches_cpu=[torch.zeros(1, 128, 1, 656, dtype=torch.int8)],
+        _get_offload_layer_id=MagicMock(return_value=0),
+    )
+    metadata = SimpleNamespace(
+        num_decode_tokens=tokens,
+        copy_sfa_pool_entries=torch.zeros(count, dtype=torch.int32),
+        copy_sfa_cache_tokens=torch.tensor([2048], dtype=torch.int32),
+        copy_sfa_logical_lens=torch.tensor([2049], dtype=torch.int32),
+        copy_sfa_query_ends=torch.tensor([1], dtype=torch.int32),
+        copy_sfa_hbm_block_table=torch.zeros((1, 2), dtype=torch.int32),
+        copy_sfa_source_block_table=torch.zeros((1, 1), dtype=torch.int32),
+    )
+    op = MagicMock()
+    with patch(
+        "vllm_ascend.attention.sfa_kv_offload.torch.ops._C_ascend",
+        SimpleNamespace(npu_fused_quant_scatter_copy_sparse_flash_attention=op),
+    ):
+        impl._copy_sfa_attention(
+            torch.zeros(tokens, heads, 512, dtype=torch.bfloat16),
+            torch.zeros(tokens, heads, 64, dtype=torch.bfloat16),
+            impl.lim_topk_src,
+            metadata,
+            manager,
+            "layer",
+        )
+
+    args = op.call_args.args
+    assert args[7].data_ptr() == impl.lim_reuse_topk_misses.data_ptr()
+    assert args[9].item() == 1025
+    assert args[10].item() == 1024
+    assert args[13].data_ptr() == impl.lim_reuse_misses.data_ptr()
+
+
+def test_c8_mtp_compacts_rejected_draft_rows():
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.lim_reuse_request_count = 2
+    impl.lim_topk_src = torch.tensor([[[11], [22]], [[33], [44]]], dtype=torch.int32)
+    impl.lim_topk_dst = torch.tensor([[[55], [66]], [[77], [88]]], dtype=torch.int32)
+    impl.compact_lim_topk_metadata(torch.tensor([1, 0]))
+    assert impl.lim_topk_src[0, 0].item() == 33
+    assert impl.lim_topk_dst[0, 0].item() == 77
+    assert impl.lim_topk_src[1, 0].item() == 11
+    assert impl.lim_topk_dst[1, 0].item() == 55
+
+
+def test_c8_mtp_exec_kv_writes_each_current_packed_row():
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.enable_sparse_sfa_c8 = True
+    impl.kv_lora_rank = 512
+    impl.qk_rope_head_dim = 64
+    impl._is_decode_only = MagicMock(return_value=True)
+    impl._offload_layer_name = MagicMock(return_value="layer")
+    impl._cpu_cache_pair = MagicMock(return_value=(torch.zeros(1, 128, 1, 656, dtype=torch.int8), None))
+    impl._in_graph_runtime = MagicMock(return_value=False)
+    nope = torch.arange(2 * 512, dtype=torch.int8).view(torch.float8_e4m3fn)
+    rope = torch.arange(2 * 128, dtype=torch.int8).view(torch.float8_e4m3fn)
+    scale = torch.arange(2 * 16, dtype=torch.int8).view(torch.float8_e4m3fn)
+    impl._compute_kv_only = MagicMock(return_value=(nope, rope, scale))
+    hot = torch.zeros(1, 256, 1, 656, dtype=torch.int8)
+    manager = SimpleNamespace(
+        topk_buffers_k=[hot],
+        offload_new_kv=MagicMock(),
+        _get_offload_layer_id=MagicMock(return_value=0),
+    )
+    metadata = SimpleNamespace(fused_copy_sfa_enabled=True, copy_sfa_device_slots=torch.tensor([5, 6]))
+    with patch("vllm_ascend.attention.sfa_kv_offload.get_sparse_kv_offload_manager", return_value=manager):
+        impl.exec_kv(None, None, None, (None,), torch.tensor([5, 6]), metadata)
+
+    expected = impl._pack_c8_kv(rope, nope, scale)
+    torch.testing.assert_close(hot.view(-1, 656)[5:7], expected)
+    manager.offload_new_kv.assert_called_once()
+    torch.testing.assert_close(manager.offload_new_kv.call_args.kwargs["k"], expected)
+    assert manager.offload_new_kv.call_args.kwargs["has_prefill"] is False
+
+
 def test_reshape_sparse_offload_packed_c8_cache():
     spec = SimpleNamespace(
         cache_sparse_sfa_c8=True,

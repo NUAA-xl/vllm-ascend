@@ -787,6 +787,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         reuse_indices = self.skip_topk and owner is self
         if reuse_indices and not self.has_indexer:
             raise RuntimeError("fused_copy_sfa shared indexer owner was not bound during model initialization")
+        if reuse_indices and self.enable_sparse_sfa_c8 and self.lim_reuse_request_count <= 0:
+            raise RuntimeError("packed-C8 shared-indexer reuse requires a completed draft-step-0 LIM selection")
         layer_id = manager._get_offload_layer_id(layer_name)
         if reuse_indices:
             cache_tokens = self.copy_sfa_reuse_cache_tokens[:count]

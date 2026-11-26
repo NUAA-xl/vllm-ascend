@@ -94,12 +94,13 @@ def _make_owner(impl, backend, rope_dim=64):
     return layer
 
 
-def _get_owner_spec(monkeypatch, layer):
+def _get_owner_spec(monkeypatch, layer, *, is_draft=False):
     source = MLAAttentionSpec(
         block_size=128,
         num_kv_heads=1,
         head_size=layer.kv_lora_rank + layer.qk_rope_head_dim,
         dtype=torch.bfloat16,
+        is_draft=is_draft,
     )
     monkeypatch.setattr(MLAAttention, "get_kv_cache_spec", lambda *_: source)
     config = SimpleNamespace(
@@ -112,7 +113,8 @@ def _get_owner_spec(monkeypatch, layer):
     "format_name,width", [("bf16", 576), ("c8", 656), ("c8_nope", 528), ("tq", 386), ("tq_both", 386)]
 )
 @pytest.mark.parametrize("offload", [False, True])
-def test_sfa_spec_uses_owner_decisions_and_backend_packing(monkeypatch, format_name, width, offload):
+@pytest.mark.parametrize("is_draft", [False, True])
+def test_sfa_spec_uses_owner_decisions_and_backend_packing(monkeypatch, format_name, width, offload, is_draft):
     impl = AscendSFAImpl.__new__(AscendSFAImpl)
     impl.enable_sparse_sfa_c8 = format_name in ("c8", "c8_nope", "tq_both")
     impl.enable_sparse_sfa_turboquant = format_name in ("tq", "tq_both")
@@ -121,10 +123,10 @@ def test_sfa_spec_uses_owner_decisions_and_backend_packing(monkeypatch, format_n
     impl.kv_cache_dtype = "turboquant" if impl.enable_sparse_sfa_turboquant else "int8"
     impl.store_kv_cache_on_host = offload
     layer = _make_owner(impl, AscendSFABackend, rope_dim=0 if format_name == "c8_nope" else 64)
-    spec = _get_owner_spec(monkeypatch, layer)
+    spec = _get_owner_spec(monkeypatch, layer, is_draft=is_draft)
     assert spec.head_size == width
     assert spec.dtype == (torch.bfloat16 if format_name == "bf16" else torch.int8)
-    assert spec.store_on_host is offload
+    assert spec.store_on_host is (offload and (not is_draft or format_name in ("c8", "c8_nope")))
     assert spec.cache_sparse_sfa_c8 is (format_name in ("c8", "c8_nope"))
     assert spec.cache_sparse_sfa_turboquant is (format_name in ("tq", "tq_both"))
     assert spec.page_size_bytes == 128 * (1152 if format_name == "bf16" else width)
